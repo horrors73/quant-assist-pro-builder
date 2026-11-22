@@ -80,7 +80,7 @@ jobs:
               tail -n 1 "$out" | cut -c1-160
             else
               echo "::error::failed with exit code $rc. Output is hidden because this log is public: run it locally, or run the workflow again with verbose switched on."
-              { grep -E '^(FAILED|FAIL|ERROR) ' "$out" | sed 's/ - .*//' | cut -c1-160 | head -20; } || true
+              { grep -E '^[[:space:]]*(✖|×|not ok|FAILED|FAIL|ERROR) ' "$out" | sed 's/ - .*//' | cut -c1-160 | head -20; } || true
             fi
             rm -f "$out"
             return "$rc"
@@ -163,7 +163,7 @@ jobs:
               tail -n 1 "$out" | cut -c1-160
             else
               echo "::error::failed with exit code $rc. Output is hidden because this log is public: run it locally, or run the workflow again with verbose switched on."
-              { grep -E '^(FAILED|FAIL|ERROR) ' "$out" | sed 's/ - .*//' | cut -c1-160 | head -20; } || true
+              { grep -E '^[[:space:]]*(✖|×|not ok|FAILED|FAIL|ERROR) ' "$out" | sed 's/ - .*//' | cut -c1-160 | head -20; } || true
             fi
             rm -f "$out"
             return "$rc"
