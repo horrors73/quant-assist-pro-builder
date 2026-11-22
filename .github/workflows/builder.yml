@@ -286,7 +286,9 @@ jobs:
 
       # What an installed app would download to get this release (only the changed blocks). Fails when it is far more
       # than usual, so a 150 MB update is stopped here instead of reaching users. See scripts/check_update_size.py.
+      # A test version (anything without "-pro.") only warns here, so a test run goes on to the upload. A real X.Y.Z-pro.N must pass.
       - name: Check the update download size
+        continue-on-error: ${{ !contains(inputs.version, '-pro.') }}
         run: $PY scripts/check_update_size.py "$DL_BASE" "build/installers/QuantAssistPro-$VERSION-windows-x64-setup.exe.blockmap" "$VERSION"
 
       # Rebuilds this installer from the previous release the way an installed app does (only the changed blocks) and checks
