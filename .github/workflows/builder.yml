@@ -1,0 +1,318 @@
+# QuantAssist Pro builder. Public repo, no source code: it pulls the private source with a read-only deploy key,
+# runs the checks and the build on GitHub's free runners, and uploads the large build files to the Pro R2 bucket.
+# It never holds the update signing key and never writes the manifest (latest.json): the owner signs and publishes that
+# from their own PC (scripts/publish_local.sh in the private repo), so nothing reaches users without the owner.
+#
+# Run it by hand only (Actions -> builder -> Run workflow). No tag or pull request starts it.
+#
+#   secret SOURCE_DEPLOY_KEY            private half of a READ-ONLY deploy key on horrors73/quant-assist-pro
+#   secret RELEASE_FORBIDDEN_STRINGS    comma-separated personal strings that must not appear in a build (a secret, so logs mask it)
+#   environment "publish" (needs the owner's approval), secrets: R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_ACCOUNT_ID, R2_BUCKET
+
+name: builder
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to build, without the leading v (X.Y.Z, X.Y.Z-rc.N or X.Y.Z-pro.N)
+        required: true
+      ref:
+        description: Branch, tag or commit of the private repo to build
+        required: false
+        default: main
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    runs-on: ubuntu-22.04
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - id: check
+        shell: bash
+        env:
+          REF: ${{ inputs.version }}
+        run: |
+          # Through the environment, never interpolated: a ref name is attacker-shaped text.
+          raw="${REF#v}"
+          if ! [[ "$raw" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-(rc|pro)\.[0-9]+)?$ ]]; then
+            echo "::error::'$raw' is not X.Y.Z, X.Y.Z-rc.N or X.Y.Z-pro.N"; exit 1
+          fi
+          echo "version=$raw" >> "$GITHUB_OUTPUT"
+
+  # Runs beside the build, not before it: a failure here still blocks publishing, but the tests no longer add their
+  # minutes to the time it takes to get an installer.
+  checks:
+    needs: version
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: horrors73/quant-assist-pro
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.14.10"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+
+      - name: Install backend dependencies
+        run: |
+          python -m venv .venv
+          .venv/Scripts/python -m pip install --require-hashes -r backend/requirements-release.txt
+          .venv/Scripts/python -m pip install pytest pytest-asyncio respx
+
+      - name: Backend tests
+        run: cd backend && ../.venv/Scripts/python -m pytest tests -q
+
+      - name: Frontend tests
+        run: |
+          npm --prefix frontend ci
+          npm --prefix frontend test -- --run
+
+      - name: Desktop tests
+        env:
+          # The unit tests never start Electron, so its large binary is not downloaded here (a flaky download failed this job).
+          ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+        run: |
+          # The data-copy tests build real SQLite and DuckDB files with `python`: use the backend venv (it has duckdb).
+          export PATH="$PWD/.venv/Scripts:$PATH"
+          npm --prefix desktop ci
+          npm --prefix desktop test
+
+  build:
+    needs: version
+    strategy:
+      # One platform failing must not hide the other's result; publishing still needs both.
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            builder: --win nsis
+            unpacked: win-unpacked
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      RELEASE_FORBIDDEN_STRINGS: ${{ secrets.RELEASE_FORBIDDEN_STRINGS }}
+      # Where the previous release is read from (the size check and the update rehearsals): the download gateway, which serves
+      # builds to anyone, so the build job needs no credentials for it.
+      DL_BASE: https://pro-dl.xhinku.com
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: horrors73/quant-assist-pro
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.14.10"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+
+      # Every dependency pinned with hashes (backend/requirements-release.txt), so a build a year
+      # from now installs what was tested today.
+      - name: Install backend dependencies and build tools
+        run: |
+          python -m venv .venv
+          if [ "$RUNNER_OS" = Windows ]; then PY=".venv/Scripts/python"; else PY=".venv/bin/python"; fi
+          echo "PY=$PY" >> "$GITHUB_ENV"
+          $PY -m pip install --require-hashes -r backend/requirements-release.txt
+          $PY -m pip install nuitka
+          if [ "$RUNNER_OS" = Linux ]; then $PY -m pip install patchelf; fi
+
+      - name: Build the frontend and install the desktop tools
+        run: |
+          # The release's name (first line of release-name.txt) is shown beside the version in Settings.
+          export VITE_RELEASE_NAME="$(head -n 1 release-name.txt 2>/dev/null | tr -d '\r' | cut -c1-40)"
+          npm --prefix frontend ci
+          npm --prefix frontend run build
+          # The Electron download is the one network fetch here; GitHub has slow spells, so it gets a few tries.
+          for attempt in 1 2 3 4; do
+            npm --prefix desktop ci && break
+            [ "$attempt" = 4 ] && { echo "::error::desktop install failed 4 times"; exit 1; }
+            echo "::warning::desktop install failed (attempt $attempt); retrying"; sleep $((attempt * 20))
+          done
+
+      # Compiles only our own code (a few minutes) and bundles Python plus the hash-pinned libraries around it.
+      - name: Build the backend (compile our code, bundle Python and libraries)
+        run: $PY scripts/build_backend.py --output-dir build/backend
+
+      # Everything in the app except the code package (Electron, Python, libraries, shell code), as one id. An installed app
+      # applies a release's code package by itself only when this id matches its own; otherwise it uses the installer.
+      - name: Compute the shell id
+        run: |
+          $PY scripts/shell_id.py
+          echo "SHELL_ID=$($PY -c 'import json;print(json.load(open("desktop/src/shell-id.json"))["shellId"])')" >> "$GITHUB_ENV"
+
+      - name: Package the installer
+        run: |
+          cd desktop
+          npx electron-builder ${{ matrix.builder }} --publish never -c.extraMetadata.version="$VERSION"
+
+      # An app without its shell id inside can never apply a code package, and nothing else would notice.
+      - name: Check the shell id is inside the packaged app
+        run: |
+          cd desktop
+          npx asar extract-file "../build/installers/${{ matrix.unpacked }}/resources/app.asar" src/shell-id.json
+          test "$(node -p "require('./shell-id.json').shellId")" = "$SHELL_ID" || { echo "::error::the packaged app carries a different shell id"; exit 1; }
+          rm -f shell-id.json
+
+      # The switches inside the Electron program (electronFuses in desktop/electron-builder.yml): only a validated app.asar loads,
+      # no plain-Node mode, no debugger or NODE_OPTIONS. The first check reads them off the real packaged app and compares the
+      # asar hash recorded in the exe; the second launches a minimal app with the same switches and tries to tamper with it
+      # (it stays advisory until the FUSE_TEST_BLOCKING variable is set to true, after one run has shown it works on Windows).
+      - name: Check the Electron switches on the packaged app
+        run: node desktop/scripts/check-fuses.js "build/installers/${{ matrix.unpacked }}/QuantAssist Pro.exe" "build/installers/${{ matrix.unpacked }}/resources/app.asar"
+
+      - name: Launch a minimal app with the same switches and try to tamper with it
+        continue-on-error: true
+        run: node desktop/scripts/fuse-launch-test.js
+
+      # The signed list of every file the installed app is made of. The hash of this list is signed into the update manifest in the
+      # publishing job; the installed app checks its own files against it at every start (desktop/src/integrity.js).
+      - name: List every file of the unpacked app
+        run: |
+          $PY scripts/build_integrity.py build "$VERSION" "build/installers/${{ matrix.unpacked }}" build/installers/integrity.json
+          $PY scripts/build_integrity.py check "build/installers/${{ matrix.unpacked }}" build/installers/integrity.json
+
+      # The small download an installed app can apply with a restart: compiled backend, run.py and UI.
+      - name: Build the code package
+        run: |
+          $PY scripts/build_payload.py "$VERSION" "$SHELL_ID" build/backend/runtime frontend/dist "build/installers/QuantAssistPro-$VERSION-payload.zip"
+          echo "$SHELL_ID" > build/installers/shell-id.txt
+
+      # The package's own code must be what runs (the bundled copy would answer just as well), so the smoke test checks it.
+      - name: Smoke-test the code package on this release's runtime
+        run: |
+          $PY -c 'import sys,zipfile;zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])' "build/installers/QuantAssistPro-$VERSION-payload.zip" build/payload-test
+          cd desktop
+          QA_RESOURCES_PATH="$GITHUB_WORKSPACE/build/installers/${{ matrix.unpacked }}/resources" QA_PAYLOAD_DIR="$GITHUB_WORKSPACE/build/payload-test" node scripts/smoke-sidecar.js
+
+      # The package's file list must be consistent: every hash matches, and a changed byte is caught. Signing happens later, in the publish job.
+      - name: Check the code package's file list
+        run: |
+          $PY scripts/check_payload_hashes.py "build/installers/QuantAssistPro-$VERSION-payload.zip" build/installers/payload-meta.txt
+
+      - name: Smoke-test the packaged backend
+        run: |
+          cd desktop
+          QA_RESOURCES_PATH="$GITHUB_WORKSPACE/build/installers/${{ matrix.unpacked }}/resources" node scripts/smoke-sidecar.js
+
+      # Running the packaged app must not change any installed file, or the start-up check would fail for every customer.
+      - name: Check the unpacked app is unchanged after running it
+        run: $PY scripts/build_integrity.py check "build/installers/${{ matrix.unpacked }}" build/installers/integrity.json
+
+      - name: Scan the package for source, data and personal strings
+        run: |
+          # This log is public and the scan prints a personal string when it finds one: mask each string first.
+          IFS=',' read -ra _s <<< "$RELEASE_FORBIDDEN_STRINGS"
+          for x in "${_s[@]}"; do x="$(printf '%s' "$x" | tr -d '\r' | sed 's/^ *//;s/ *$//')"; [ -n "$x" ] && echo "::add-mask::$x"; done
+          test -n "$RELEASE_FORBIDDEN_STRINGS" || { echo "::error::set the RELEASE_FORBIDDEN_STRINGS secret"; exit 1; }
+          $PY scripts/scan_release.py "build/installers/${{ matrix.unpacked }}"
+
+      - name: Check the update files exist
+        run: |
+          cd build/installers
+          ls -l "QuantAssistPro-$VERSION-windows-x64-setup.exe" "QuantAssistPro-$VERSION-windows-x64-setup.exe.blockmap" latest.yml "QuantAssistPro-$VERSION-payload.zip" shell-id.txt payload-meta.txt integrity.json
+
+      # What an installed app would download to get this release (only the changed blocks). Fails when it is far more
+      # than usual, so a 150 MB update is stopped here instead of reaching users. See scripts/check_update_size.py.
+      - name: Check the update download size
+        run: $PY scripts/check_update_size.py "$DL_BASE" "build/installers/QuantAssistPro-$VERSION-windows-x64-setup.exe.blockmap" "$VERSION"
+
+      # Rebuilds this installer from the previous release the way an installed app does (only the changed blocks) and checks
+      # it comes out identical, so a small update that would fail its checksum is found here, not on users' computers.
+      - name: Rehearse the small update
+        run: |
+          if ! curl -fsSL --retry 5 --retry-delay 10 --retry-all-errors --max-time 120 -o latest.json "$DL_BASE/latest.json"; then
+            echo "::warning::no published release to rehearse from; the small update was not rehearsed"; exit 0
+          fi
+          prev=$($PY -c 'import json;print(json.load(open("latest.json"))["version"])')
+          echo "Rehearsing the update from $prev to $VERSION"
+          if [ "$prev" = "$VERSION" ]; then echo "::warning::$VERSION is already the latest release; the small update was not rehearsed"; exit 0; fi
+          base="$DL_BASE/releases/$prev/QuantAssistPro-$prev-windows-x64-setup.exe"
+          if ! { curl -fsSL --retry 5 --retry-delay 10 --retry-all-errors -o old.exe "$base" && curl -fsSL --retry 5 --retry-delay 10 --retry-all-errors -o old.blockmap "$base.blockmap"; }; then echo "::warning::could not fetch release $prev; the small update was not rehearsed"; exit 0; fi
+          cd desktop
+          node scripts/verify-differential.js ../old.exe ../old.blockmap "../build/installers/QuantAssistPro-$VERSION-windows-x64-setup.exe" "../build/installers/QuantAssistPro-$VERSION-windows-x64-setup.exe.blockmap"
+
+      # The rule an installed app follows: when the shell id matches, this release's code package runs on the OLD runtime.
+      # Only the previous release's own installer can test that, so it is unpacked here and the package is run on top of it.
+      - name: Rehearse the code package on the previous release's runtime
+        run: |
+          [ -f old.exe ] || { echo "::warning::no previous installer was fetched; the code package was not rehearsed on the old runtime"; exit 0; }
+          old_shell=$($PY -c 'import json;c=[x for x in json.load(open("latest.json")).get("components",[]) if x.get("type")=="payload"];print(c[0]["shellId"] if c else "")')
+          if [ -z "$old_shell" ]; then echo "::warning::the previous release has no code package, so its shell id is unknown; not rehearsed on the old runtime"; exit 0; fi
+          if [ "$old_shell" != "$SHELL_ID" ]; then echo "The shell changed since the previous release; this release is installed with the installer, so there is no old-runtime case to rehearse."; exit 0; fi
+          SEVENZ="/c/Program Files/7-Zip/7z.exe"
+          "$SEVENZ" x -y -bso0 -bsp0 -oold-outer old.exe
+          "$SEVENZ" x -y -bso0 -bsp0 -oold-app 'old-outer/$PLUGINSDIR/app-64.7z'
+          $PY -c 'import sys,zipfile;zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])' "build/installers/QuantAssistPro-$VERSION-payload.zip" build/payload-old
+          cd desktop
+          QA_RESOURCES_PATH="$GITHUB_WORKSPACE/old-app/resources" QA_PAYLOAD_DIR="$GITHUB_WORKSPACE/build/payload-old" node scripts/smoke-sidecar.js
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-files
+          path: |
+            build/installers/QuantAssistPro-${{ env.VERSION }}-windows-x64-setup.exe
+            build/installers/QuantAssistPro-${{ env.VERSION }}-windows-x64-setup.exe.blockmap
+            build/installers/latest.yml
+            build/installers/QuantAssistPro-${{ env.VERSION }}-payload.zip
+            build/installers/shell-id.txt
+            build/installers/payload-meta.txt
+            build/installers/integrity.json
+          if-no-files-found: error
+          # Hand-off to the owner's local publish step. Kept for one day (artifacts of a public repo can be downloaded by any GitHub user).
+          retention-days: 1
+
+  upload:
+    needs: [version, checks, build]
+    runs-on: ubuntu-22.04
+    # The environment holds the R2 secrets and waits for the owner's approval before the job starts.
+    environment: publish
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-files
+          path: release
+
+      # Only the large files go up here. The manifest (latest.json) is signed and uploaded last by the owner, so the
+      # apps never see a build until the owner publishes it.
+      - name: Upload the large files to the private build bucket
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          for v in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY R2_ACCOUNT_ID BUCKET; do test -n "${!v}" || { echo "::error::set $v in the publish environment"; exit 1; }; done
+          clean() { printf '%s' "$1" | tr -d '[:space:]'; }
+          export AWS_ACCESS_KEY_ID="$(clean "$AWS_ACCESS_KEY_ID")" AWS_SECRET_ACCESS_KEY="$(clean "$AWS_SECRET_ACCESS_KEY")"
+          BUCKET="$(clean "$BUCKET")"; BUCKET="${BUCKET##*/}"
+          # The Pro edition must never touch another bucket.
+          [ "$BUCKET" = quant-assist-pro-builds ] || { echo "::error::the bucket is not the Pro bucket"; exit 1; }
+          raw="$(clean "$R2_ACCOUNT_ID")"
+          [[ "$raw" =~ ([0-9a-fA-F]{32}) ]] || { echo "::error::R2_ACCOUNT_ID must contain the 32-character Cloudflare account id"; exit 1; }
+          endpoint="https://${BASH_REMATCH[1]}.r2.cloudflarestorage.com"
+          for name in "QuantAssistPro-$VERSION-windows-x64-setup.exe" "QuantAssistPro-$VERSION-windows-x64-setup.exe.blockmap" "QuantAssistPro-$VERSION-payload.zip"; do
+            test -f "release/$name" || { echo "::error::missing $name"; exit 1; }
+            aws s3 cp "release/$name" "s3://$BUCKET/releases/$VERSION/$name" --endpoint-url "$endpoint" --only-show-errors
+          done
+          echo "Uploaded the three large files for $VERSION. Now sign and publish the manifest from your PC."
