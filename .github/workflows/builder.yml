@@ -21,9 +21,16 @@ on:
         description: Branch, tag or commit of the private repo to build
         required: false
         default: main
+      verbose:
+        description: Show full step output. This log is public, so leave it off unless you are debugging
+        type: boolean
+        default: false
 
 permissions:
   contents: read
+
+env:
+  VERBOSE: ${{ inputs.verbose }}
 
 jobs:
   version:
@@ -58,6 +65,27 @@ jobs:
           ref: ${{ inputs.ref }}
           ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
           persist-credentials: false
+
+      # This log is public. Step output is hidden unless it fails, and then only failing test names show, never code lines.
+      - name: Prepare quiet output
+        shell: bash
+        run: |
+          cat > ~/q.sh <<'QEOF'
+          q() {
+            if [ "${VERBOSE:-false}" = true ]; then "$@"; return $?; fi
+            local out rc
+            out="$(mktemp)"
+            "$@" > "$out" 2>&1 && rc=0 || rc=$?
+            if [ "$rc" -eq 0 ]; then
+              tail -n 1 "$out" | cut -c1-160
+            else
+              echo "::error::failed with exit code $rc. Output is hidden because this log is public: run it locally, or run the workflow again with verbose switched on."
+              { grep -E '^(FAILED|FAIL|ERROR) ' "$out" | sed 's/ - .*//' | cut -c1-160 | head -20; } || true
+            fi
+            rm -f "$out"
+            return "$rc"
+          }
+          QEOF
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.14.10"
@@ -72,12 +100,15 @@ jobs:
           .venv/Scripts/python -m pip install pytest pytest-asyncio respx
 
       - name: Backend tests
-        run: cd backend && ../.venv/Scripts/python -m pytest tests -q
+        run: |
+          source ~/q.sh
+          cd backend && q ../.venv/Scripts/python -m pytest tests -q
 
       - name: Frontend tests
         run: |
+          source ~/q.sh
           npm --prefix frontend ci
-          npm --prefix frontend test -- --run
+          q npm --prefix frontend test -- --run
 
       - name: Desktop tests
         env:
@@ -87,7 +118,8 @@ jobs:
           # The data-copy tests build real SQLite and DuckDB files with `python`: use the backend venv (it has duckdb).
           export PATH="$PWD/.venv/Scripts:$PATH"
           npm --prefix desktop ci
-          npm --prefix desktop test
+          source ~/q.sh
+          q npm --prefix desktop test
 
   build:
     needs: version
@@ -116,6 +148,27 @@ jobs:
           ref: ${{ inputs.ref }}
           ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
           persist-credentials: false
+
+      # This log is public. Step output is hidden unless it fails, and then only failing test names show, never code lines.
+      - name: Prepare quiet output
+        shell: bash
+        run: |
+          cat > ~/q.sh <<'QEOF'
+          q() {
+            if [ "${VERBOSE:-false}" = true ]; then "$@"; return $?; fi
+            local out rc
+            out="$(mktemp)"
+            "$@" > "$out" 2>&1 && rc=0 || rc=$?
+            if [ "$rc" -eq 0 ]; then
+              tail -n 1 "$out" | cut -c1-160
+            else
+              echo "::error::failed with exit code $rc. Output is hidden because this log is public: run it locally, or run the workflow again with verbose switched on."
+              { grep -E '^(FAILED|FAIL|ERROR) ' "$out" | sed 's/ - .*//' | cut -c1-160 | head -20; } || true
+            fi
+            rm -f "$out"
+            return "$rc"
+          }
+          QEOF
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.14.10"
@@ -149,7 +202,9 @@ jobs:
 
       # Compiles only our own code (a few minutes) and bundles Python plus the hash-pinned libraries around it.
       - name: Build the backend (compile our code, bundle Python and libraries)
-        run: $PY scripts/build_backend.py --output-dir build/backend
+        run: |
+          source ~/q.sh
+          q $PY scripts/build_backend.py --output-dir build/backend
 
       # Everything in the app except the code package (Electron, Python, libraries, shell code), as one id. An installed app
       # applies a release's code package by itself only when this id matches its own; otherwise it uses the installer.
@@ -276,7 +331,7 @@ jobs:
             build/installers/payload-meta.txt
             build/installers/integrity.json
           if-no-files-found: error
-          # Hand-off to the owner's local publish step. Kept for one day (artifacts of a public repo can be downloaded by any GitHub user).
+          # Hand-off to the upload job only. The upload job deletes it once the files are in R2 (a failed or cancelled run leaves it for one day).
           retention-days: 1
 
   upload:
@@ -284,6 +339,8 @@ jobs:
     runs-on: ubuntu-22.04
     # The environment holds the R2 secrets and waits for the owner's approval before the job starts.
     environment: publish
+    permissions:
+      actions: write
     env:
       VERSION: ${{ needs.version.outputs.version }}
     steps:
@@ -315,4 +372,20 @@ jobs:
             test -f "release/$name" || { echo "::error::missing $name"; exit 1; }
             aws s3 cp "release/$name" "s3://$BUCKET/releases/$VERSION/$name" --endpoint-url "$endpoint" --only-show-errors
           done
-          echo "Uploaded the three large files for $VERSION. Now sign and publish the manifest from your PC."
+          # The small helper files the local signing step needs. They go to staging/, not releases/, so no app can reach them.
+          for name in latest.yml shell-id.txt payload-meta.txt integrity.json; do
+            if [ -f "release/$name" ]; then aws s3 cp "release/$name" "s3://$BUCKET/staging/$VERSION/$name" --endpoint-url "$endpoint" --only-show-errors; fi
+          done
+          echo "Uploaded the build files for $VERSION. Now sign and publish the manifest from your PC."
+
+      # The build is now in R2. Remove it from this public repo so nobody can download it from here.
+      - name: Delete the build artifact from this public repo
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          for id in $(gh api "repos/$REPO/actions/runs/$RUN_ID/artifacts" --jq '.artifacts[].id'); do
+            gh api -X DELETE "repos/$REPO/actions/artifacts/$id"
+          done
+          echo "Artifact removed."
