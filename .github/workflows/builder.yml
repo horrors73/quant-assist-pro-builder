@@ -321,6 +321,10 @@ jobs:
           cd desktop
           QA_RESOURCES_PATH="$GITHUB_WORKSPACE/old-app/resources" QA_PAYLOAD_DIR="$GITHUB_WORKSPACE/build/payload-old" node scripts/smoke-sidecar.js
 
+      # The commit this build was made from, so the owner's publish script reads the release notes from exactly that commit.
+      - name: Record the source commit
+        run: git rev-parse HEAD > build/installers/source-sha.txt
+
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: release-files
@@ -332,6 +336,7 @@ jobs:
             build/installers/shell-id.txt
             build/installers/payload-meta.txt
             build/installers/integrity.json
+            build/installers/source-sha.txt
           if-no-files-found: error
           # Hand-off to the upload job only. The upload job deletes it once the files are in R2 (a failed or cancelled run leaves it for one day).
           retention-days: 1
@@ -375,7 +380,7 @@ jobs:
             aws s3 cp "release/$name" "s3://$BUCKET/releases/$VERSION/$name" --endpoint-url "$endpoint" --only-show-errors
           done
           # The small helper files the local signing step needs. They go to staging/, not releases/, so no app can reach them.
-          for name in latest.yml shell-id.txt payload-meta.txt integrity.json; do
+          for name in latest.yml shell-id.txt payload-meta.txt integrity.json source-sha.txt; do
             if [ -f "release/$name" ]; then aws s3 cp "release/$name" "s3://$BUCKET/staging/$VERSION/$name" --endpoint-url "$endpoint" --only-show-errors; fi
           done
           echo "Uploaded the build files for $VERSION. Now sign and publish the manifest from your PC."
